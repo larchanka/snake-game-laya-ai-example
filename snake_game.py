@@ -403,10 +403,10 @@ class SnakeGame:
 
 
 def main():
-    print("Loading Laya AI model...")
-    agent = laya.load("convaiinnovations/laya")
+    print("Loading Laya AI model (fast mode)...")
+    agent = laya.load("convaiinnovations/laya", fast=True)
     game = SnakeGame(agent=agent)
-    game.play(step_delay=0.08)
+    game.play(step_delay=0.02)
 
 
 if __name__ == "__main__":
