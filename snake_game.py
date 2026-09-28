@@ -406,7 +406,7 @@ def main():
     print("Loading Laya AI model (fast mode)...")
     agent = laya.load("convaiinnovations/laya", fast=True)
     game = SnakeGame(agent=agent)
-    game.play(step_delay=0.02)
+    game.play(step_delay=0.05)
 
 
 if __name__ == "__main__":

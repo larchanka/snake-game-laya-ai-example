@@ -58,8 +58,8 @@ class PongGame:
         self.ai_score = 0
         self.rally_count = 0
         self.high_rally = 0
-        self.game_speed_name = "Fast (60 FPS)"
-        self.base_speed = 1.3
+        self.speed_level = 2  # 1: Relaxed, 2: Normal, 3: Fast
+        self.set_speed_level(2)
 
         # AI decision state & thread synchronization
         self.ai_action = "STAY"
@@ -70,9 +70,22 @@ class PongGame:
 
         self.reset_round(serve_to_player=random.choice([True, False]))
 
-        # Start Background AI Worker Thread for non-blocking high-speed gameplay
+        # Start Background AI Worker Thread for non-blocking gameplay
         self.ai_thread = threading.Thread(target=self._ai_worker_loop, daemon=True)
         self.ai_thread.start()
+
+    def set_speed_level(self, level: int):
+        """Set game speed preset."""
+        self.speed_level = level
+        if level == 1:
+            self.base_speed = 0.5
+            self.game_speed_name = "Relaxed [1]"
+        elif level == 3:
+            self.base_speed = 1.1
+            self.game_speed_name = "Fast [3]"
+        else:
+            self.base_speed = 0.75
+            self.game_speed_name = "Normal [2]"
 
     def reset_round(self, serve_to_player: bool = True):
         """Reset ball and paddles for a new round."""
@@ -277,7 +290,7 @@ class PongGame:
         if header_note:
             lines.append(f" {header_note}")
         else:
-            lines.append(f" {COLOR_GRAY}Controls: [W/S] or [↑/↓] Move Paddle | [Q] Quit | [R] Reset{COLOR_RESET}")
+            lines.append(f" {COLOR_GRAY}Controls: [W/S] Move | Speed: [1] Relaxed [2] Normal [3] Fast | [R] Reset | [Q] Quit{COLOR_RESET}")
 
         # Court Top Border
         lines.append(f"{COLOR_BOLD}┌" + "─" * self.width + "┐" + COLOR_RESET)
@@ -366,17 +379,17 @@ def main():
     try:
         game.run_countdown(3)
 
-        ai_paddle_move_interval = 0.03
+        ai_paddle_move_interval = 0.04
         last_ai_paddle_move = 0.0
 
-        # High-performance 60 FPS loop
-        target_fps = 60
+        # Balanced 35 FPS loop
+        target_fps = 35
         frame_duration = 1.0 / target_fps
 
         while True:
             frame_start = time.time()
 
-            # 1. Non-blocking Player Input (Instant response)
+            # 1. Non-blocking Player Input
             while True:
                 key = read_key_nonblocking()
                 if not key:
@@ -388,6 +401,12 @@ def main():
                     game.move_player(-1)
                 elif key in ["s", "S", "DOWN", "j"]:
                     game.move_player(1)
+                elif key == "1":
+                    game.set_speed_level(1)
+                elif key == "2":
+                    game.set_speed_level(2)
+                elif key == "3":
+                    game.set_speed_level(3)
                 elif key in ["r", "R"]:
                     game.player_score = 0
                     game.ai_score = 0
