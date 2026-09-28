@@ -1,4 +1,4 @@
-# Laya AI Games (CLI)
+# Laya AI Games Suite (CLI)
 
 Terminal games powered by [Laya AI](https://github.com/convaiinnovations/laya) for real-time decision-making.
 
@@ -12,14 +12,7 @@ An autonomous snake game played on a 20x20 grid, fully controlled by Laya AI.
 - **5-to-0 Second Countdown:** Visual countdown before the game starts.
 - **Dynamic Targets & Growth:** Food appears randomly across open cells; the snake grows upon eating food.
 - **Continuous Play:** Automatically respawns on game over and continues until stopped (`Ctrl+C`).
-- **Live Telemetry HUD:** Displays score, snake length, high score, Laya's decided direction, calibrated confidence, and probability distribution across all 4 directions.
-
-#### How the Snake AI Works
-1. **Scene Analysis:** On every step, the game analyzes the 20x20 field:
-   - Obstacles (walls, snake body, and 180° neck reversals).
-   - BFS pathfinding distance to the active food target.
-   - Flood-fill open space to prevent entering dead ends.
-2. **Criteria-Driven Decision:** State and candidate moves (`UP`, `DOWN`, `LEFT`, `RIGHT`) are formatted into typed choice questions with dynamic criteria for Laya to evaluate in a single forward pass.
+- **Telemetry HUD:** Displays score, snake length, high score, Laya's decided direction, calibrated confidence, and probability distribution across all 4 directions.
 
 ---
 
@@ -33,10 +26,25 @@ A real-time Pong match where you play against a Laya AI opponent.
   - `Q` or `Ctrl+C` : Quit game
 - **Live Scoreboard & Telemetry:** Tracks player score, AI score, current rally length, best rally record, and real-time AI move confidence.
 
-#### How the Pong AI Works
-1. **Multithreaded Execution:** Laya AI inference runs in a dedicated background worker thread, ensuring the game loop and user keyboard input remain fluid and responsive with zero lag.
-2. **Trajectory Prediction:** Simulates ball vector and wall reflections to predict intercept points on the AI paddle line.
-3. **AI Decision Engine:** Formulates paddle positioning decisions (`UP`, `DOWN`, `STAY`) based on predicted intercept coordinates.
+---
+
+### 3. Checkers Game (`chess.py`)
+An 8x8 Checkers (English Draughts) game where a human player competes against Laya AI.
+
+- **Pieces:**
+  - `🔴` Player Men / `👑` Player Kings (Red/Green)
+  - `🔵` AI Men / `💎` AI Kings (Cyan/Magenta)
+- **Rules & Mechanics:**
+  - Diagonal single-step forward advances.
+  - Jump captures and chained multi-jumps (mandatory capture rule).
+  - King crowning on reaching the opposite back row (Kings move & jump in all 4 diagonal directions).
+- **Controls & Input:**
+  - Enter move number (e.g. `1`, `2`) from the legal moves list.
+  - Or enter algebraic notation (e.g. `C3-D4`, `C3 to D4`, `C3xD4`).
+  - Type `q` or `quit` to exit.
+- **Laya AI Decision Engine:**
+  - Evaluates all legal moves, tactical captures, king promotion opportunities, and center control.
+  - Selects moves via typed choice reasoning with calibrated confidence and candidate probability distributions.
 
 ---
 
@@ -56,6 +64,11 @@ A real-time Pong match where you play against a Laya AI opponent.
 ---
 
 ## Running the Games
+
+### Run Checkers:
+```bash
+python chess.py
+```
 
 ### Run Snake:
 ```bash
