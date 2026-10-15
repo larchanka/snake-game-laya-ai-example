@@ -1,6 +1,6 @@
 # Laya AI Games Suite (CLI)
 
-Terminal games powered by [Laya AI](https://github.com/convaiinnovations/laya) for real-time decision-making.
+Terminal games powered by [Laya AI](https://github.com/NandhaKishorM/laya) for real-time decision-making.
 
 ---
 
