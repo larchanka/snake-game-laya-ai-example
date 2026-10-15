@@ -14,6 +14,7 @@ import termios
 import signal
 import atexit
 import argparse
+import shutil
 import warnings
 import itertools
 import re
@@ -44,6 +45,8 @@ CLEAR_SCREEN = "\033[2J"
 CURSOR_HOME = "\033[H"
 HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
+CLEAR_LINE = "\033[K"
+CLEAR_BELOW = "\033[J"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 COLOR_DIM = "\033[2m"
@@ -312,6 +315,151 @@ def describe_hand_holding(hole_cards: List[Card], community_cards: List[Card]) -
     return desc
 
 
+def check_draws(all_cards: List[Card], comm_cards: List[Card]) -> Tuple[bool, bool, bool]:
+    """Returns (has_flush_draw, has_oesd, has_gutshot) on Flop and Turn."""
+    if len(comm_cards) not in (3, 4):
+        return (False, False, False)
+
+    suit_counts = Counter(c.suit for c in all_cards)
+    has_flush_draw = any(cnt == 4 for cnt in suit_counts.values())
+
+    ranks_set = set(c.rank for c in all_cards)
+    if 14 in ranks_set:
+        ranks_set.add(1)
+
+    has_oesd = False
+    has_gutshot = False
+
+    for low in range(1, 11):
+        span = set(range(low, low + 5))
+        inter = span.intersection(ranks_set)
+        if len(inter) == 4:
+            missing = span - inter
+            miss_val = list(missing)[0]
+            if miss_val in (low, low + 4) and (low > 1 and low + 4 < 14):
+                has_oesd = True
+            else:
+                has_gutshot = True
+
+    return (has_flush_draw, has_oesd, has_gutshot)
+
+
+def categorize_hand_strength(hole_cards: List[Card], community_cards: List[Card]) -> str:
+    """
+    Classify hands into semantic tiers:
+    - MONSTER: Full house or better, nut flush, nut straight, pocket AA/KK preflop.
+    - STRONG: Top pair with strong kicker (J+), overpairs, two pair, sets, strong draws, QQ/JJ/AK preflop.
+    - MEDIUM: Middle/bottom pair, weak top pair, gutshots/draws, medium pocket pairs, broadways preflop.
+    - WEAK: Unpaired trash, undercards, 7-2, missed draws on river.
+    """
+    if not hole_cards:
+        return "WEAK"
+
+    # Pre-flop holding evaluation
+    if not community_cards:
+        if len(hole_cards) < 2:
+            return "WEAK"
+        c1, c2 = sorted(hole_cards, key=lambda c: c.rank, reverse=True)
+        r1, r2 = c1.rank, c2.rank
+        is_pair = (r1 == r2)
+        is_suited = (c1.suit == c2.suit)
+        gap = r1 - r2
+
+        # MONSTER: Pocket Aces and Kings
+        if is_pair and r1 >= 13:
+            return "MONSTER"
+
+        # STRONG: QQ, JJ, AKs, AKo, AQs, AJs, KQs
+        if is_pair and r1 in (11, 12):
+            return "STRONG"
+        if r1 == 14 and r2 == 13:
+            return "STRONG"
+        if is_suited and ((r1 == 14 and r2 in (11, 12)) or (r1 == 13 and r2 == 12)):
+            return "STRONG"
+
+        # MEDIUM: Pocket pairs 22-TT, suited connectors/gaps, broadways, suited Ax
+        if is_pair and r1 <= 10:
+            return "MEDIUM"
+        if r1 >= 10 and r2 >= 10:
+            return "MEDIUM"
+        if is_suited and (r1 == 14 or (gap in (1, 2) and r2 >= 5)):
+            return "MEDIUM"
+
+        return "WEAK"
+
+    # Post-flop evaluation (3..5 community cards)
+    all_cards = hole_cards + community_cards
+    cat, tiebreak, desc, _ = eval_7_cards(all_cards)
+
+    comm_ranks = [c.rank for c in community_cards]
+    max_comm_rank = max(comm_ranks) if comm_ranks else 0
+    hole_ranks = [c.rank for c in hole_cards]
+    max_hole_rank = max(hole_ranks) if hole_ranks else 0
+
+    has_flush_draw, has_oesd, has_gutshot = check_draws(all_cards, community_cards)
+
+    # 1. MONSTER
+    if cat >= 6:  # Full House, Quads, Straight Flush, Royal Flush
+        return "MONSTER"
+
+    if cat == 5:  # Flush
+        # Nut flush check: Ace of flush suit or King if Ace on board
+        suit_counts = Counter(c.suit for c in all_cards)
+        flush_suit = next((s for s, cnt in suit_counts.items() if cnt >= 5), None)
+        if flush_suit:
+            hole_suit_ranks = [c.rank for c in hole_cards if c.suit == flush_suit]
+            comm_suit_ranks = [c.rank for c in community_cards if c.suit == flush_suit]
+            if 14 in hole_suit_ranks or (14 in comm_suit_ranks and 13 in hole_suit_ranks):
+                return "MONSTER"
+        return "STRONG"
+
+    if cat == 4:  # Straight
+        # Nut straight check: straight_top is 14 or top board run
+        straight_top = tiebreak[0] if tiebreak else 0
+        if straight_top == 14 or straight_top >= max_comm_rank + 2:
+            return "MONSTER"
+        return "STRONG"
+
+    # 2. STRONG
+    if cat == 3:  # Three of a Kind (Set / Trips)
+        return "STRONG"
+
+    if cat == 2:  # Two Pair
+        return "STRONG"
+
+    # Overpair (pocket pair higher than all community cards)
+    if len(hole_cards) == 2 and hole_cards[0].rank == hole_cards[1].rank and hole_cards[0].rank > max_comm_rank:
+        return "STRONG"
+
+    # Top Pair with Strong Kicker (J+)
+    if cat == 1:
+        paired_rank = tiebreak[0]
+        if paired_rank == max_comm_rank:
+            kicker = min(hole_ranks) if max(hole_ranks) == paired_rank else max(hole_ranks)
+            if kicker >= 11:
+                return "STRONG"
+
+    # Strong Combo Draw (Flush draw + Straight draw)
+    if (has_flush_draw and (has_oesd or has_gutshot)) or (has_flush_draw and max_hole_rank > max_comm_rank):
+        return "STRONG"
+
+    # 3. MEDIUM
+    if cat == 1:
+        # Any other pair (Top pair weak kicker, Middle pair, Bottom pair, Underpair)
+        return "MEDIUM"
+
+    # Draws with high card
+    if has_flush_draw or has_oesd or has_gutshot:
+        return "MEDIUM"
+
+    # Overcards (both hole cards higher than highest community card)
+    if len(hole_ranks) == 2 and hole_ranks[0] > max_comm_rank and hole_ranks[1] > max_comm_rank:
+        return "MEDIUM"
+
+    # 4. WEAK
+    return "WEAK"
+
+
 # ============================================================================
 # 3. Side Pots & Split Pot Distribution
 # ============================================================================
@@ -384,7 +532,7 @@ def create_default_players() -> List[Player]:
             pid=0,
             name="Aggressive Alice",
             persona_short="LAG",
-            persona_desc="Loose-Aggressive (LAG): bluffs often, applies high pressure with bets and raises, raises with draws and medium holdings, punishes passive checking.",
+            persona_desc="Loose-Aggressive (LAG): opportunistic aggressor; bets and raises for value with strong hands or as tactical bluffs with draws; checks medium hands to control pot size; folds weak trash facing heavy bets.",
             color=COLOR_MAGENTA,
             chips=500
         ),
@@ -392,7 +540,7 @@ def create_default_players() -> List[Player]:
             pid=1,
             name="Solid Bob",
             persona_short="TAG",
-            persona_desc="Tight-Aggressive (TAG): mathematically sound, respects pot odds, folds weak or speculative holdings under pressure, value bets monster hands decisively.",
+            persona_desc="Tight-Aggressive (TAG): disciplined and mathematically sound; folds weak holdings when facing bets; checks medium hands; bets and raises decisively with strong and monster holdings.",
             color=COLOR_CYAN,
             chips=500
         ),
@@ -400,7 +548,7 @@ def create_default_players() -> List[Player]:
             pid=2,
             name="Tricky Charlie",
             persona_short="Tricky",
-            persona_desc="Unpredictable (TRICKY): deceptive playstyle, mixes slow-plays and trap check-calls with monster hands, floats draws, and launches surprise raises.",
+            persona_desc="Deceptive (TRICKY): crafty and unpredictable; slow-plays and traps opponents with monster hands by check-calling; floats bets with draws; springs surprise raises and bluffs when sensing weakness.",
             color=COLOR_YELLOW,
             chips=500
         )
@@ -473,7 +621,8 @@ class LayaPokerEngine:
         - player's private hole cards
         - public community cards
         - pot, bets, to_call, pot odds %
-        - player's evaluated hand & persona
+        - player's evaluated hand, semantic hand tier & persona
+        - situational pot odds assessment
         - recent public betting history
         Opponent private cards and undealt deck cards are STRICTLY redacted.
         """
@@ -484,13 +633,31 @@ class LayaPokerEngine:
             pot_odds = (to_call / (pot + to_call)) * 100.0
             pot_odds_str = f"{pot_odds:.1f}%"
         else:
+            pot_odds = 0.0
             pot_odds_str = "0.0% (Free Check)"
 
         eval_desc = describe_hand_holding(player.hole_cards, community_cards)
+        hand_tier = categorize_hand_strength(player.hole_cards, community_cards)
         hole_str = " ".join(c.raw_str() for c in player.hole_cards)
         comm_str = " ".join(c.raw_str() for c in community_cards) if community_cards else "None (Pre-Flop)"
 
         recent_hist = "; ".join(betting_history[-4:]) if betting_history else "No actions yet this street"
+
+        # Explicit situational pot odds assessment
+        if to_call == 0:
+            pot_odds_assessment = "Checking is free (0 chips to call). Zero risk to see next card for free."
+        else:
+            if hand_tier == "MONSTER":
+                pot_odds_assessment = f"Pot odds {pot_odds:.1f}%. Monster hand has commanding equity. Highly favorable to value bet or raise."
+            elif hand_tier == "STRONG":
+                pot_odds_assessment = f"Pot odds {pot_odds:.1f}%. Strong holding has positive equity. Favorable to call or raise for value."
+            elif hand_tier == "MEDIUM":
+                if pot_odds <= 28.0:
+                    pot_odds_assessment = f"Pot odds {pot_odds:.1f}% are favorable for drawing equity or medium hand. Call justified."
+                else:
+                    pot_odds_assessment = f"Pot odds {pot_odds:.1f}% are unfavorable for medium hand facing bet. Consider folding or floating."
+            else:  # WEAK
+                pot_odds_assessment = f"Pot odds {pot_odds:.1f}%. Weak holding has poor equity against bet. Disciplined fold recommended unless bluffing."
 
         isolated_state = {
             "player": player.name,
@@ -504,6 +671,9 @@ class LayaPokerEngine:
             "player_street_bet": player.street_bet,
             "to_call": to_call,
             "pot_odds_pct": pot_odds_str,
+            "hand_tier": hand_tier,
+            "hand_summary": f"{hand_tier}: {eval_desc}",
+            "pot_odds_assessment": pot_odds_assessment,
             "evaluated_hand": eval_desc,
             "dealer_button": dealer_name,
             "active_opponents": active_opponents_count,
@@ -511,21 +681,57 @@ class LayaPokerEngine:
             "betting_history": recent_hist
         }
 
+        # Dynamically generate situational Laya decision criteria for action
+        if to_call == 0:
+            action_criteria = {
+                "CHECK_CALL": "Check to see next card for free at zero cost.",
+                "RAISE": "Bet for value with strong hands or as a tactical bluff with aggressive persona."
+            }
+        else:
+            action_criteria = {
+                "FOLD": "Fold cards to preserve stack with weak hand or unfavorable pot odds.",
+                "CHECK_CALL": "Call the current bet with drawing equity, medium strength, or favorable pot odds.",
+                "RAISE": "Raise to build pot with strong hand or exert heavy pressure.",
+                "ALL_IN": "Shove all-in with monster hand or desperate short stack."
+            }
+
+        questions = {
+            "action": {
+                "type": "choice",
+                "instructions": f"What poker action should {player.name} take next given their {hand_tier} hand, persona, and table situation?",
+                "criteria": action_criteria
+            },
+            "tactical_intent": {
+                "type": "choice",
+                "instructions": "What is the primary tactical intent or reasoning behind this action?",
+                "criteria": {
+                    "VALUE_BET": "Betting or raising with a strong hand to extract chips from weaker hands.",
+                    "BLUFF_PRESSURE": "Aggressively betting or raising with marginal or draw cards to force better hands to fold.",
+                    "POT_ODDS_DEFENSE": "Checking or calling because pot odds and draw equity mathematically justify seeing the next card.",
+                    "DISCIPLINED_FOLD": "Mucking cards to avoid spewing chips with an inferior or unpromising holding.",
+                    "TRAP_SLOWPLAY": "Checking or calling with a monster hand to induce bluffs or keep opponents in the pot."
+                }
+            }
+        }
+
         t0 = time.perf_counter()
         try:
-            res = self.agent.predict(isolated_state, LAYA_QUESTIONS)
+            res = self.agent.predict(isolated_state, questions)
             latency_ms = (time.perf_counter() - t0) * 1000.0
 
             answers = res.get("answers", {})
             act_obj = answers.get("action", {})
             action_choice = act_obj.get("choice", "CHECK_CALL")
             action_conf = act_obj.get("confidence", 0.0)
-            action_probs = act_obj.get("probabilities", {
+            default_act_probs = {
+                "CHECK_CALL": 0.60, "RAISE": 0.40, "ALL_IN": 0.0, "FOLD": 0.0
+            } if to_call == 0 else {
                 "CHECK_CALL": 0.40, "RAISE": 0.30, "ALL_IN": 0.15, "FOLD": 0.15
-            })
+            }
+            action_probs = act_obj.get("probabilities", default_act_probs)
 
             int_obj = answers.get("tactical_intent", {})
-            intent_choice = int_obj.get("choice", "VALUE_BET")
+            intent_choice = int_obj.get("choice", "POT_ODDS_DEFENSE")
             intent_conf = int_obj.get("confidence", 0.0)
             intent_probs = int_obj.get("probabilities", {
                 "VALUE_BET": 0.30, "BLUFF_PRESSURE": 0.25, "POT_ODDS_DEFENSE": 0.25,
@@ -535,9 +741,11 @@ class LayaPokerEngine:
         except Exception as e:
             # Robust Rule-Based Fallback if inference fails
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            action_choice, intent_choice = self._persona_rule_fallback(player, to_call, eval_desc)
+            action_choice, intent_choice = self._persona_rule_fallback(player, to_call, hand_tier, eval_desc)
             action_conf = 0.50
             action_probs = {
+                "CHECK_CALL": 0.60, "RAISE": 0.40, "ALL_IN": 0.0, "FOLD": 0.0
+            } if to_call == 0 else {
                 "CHECK_CALL": 0.40, "RAISE": 0.30, "ALL_IN": 0.15, "FOLD": 0.15
             }
             intent_probs = {
@@ -545,18 +753,18 @@ class LayaPokerEngine:
                 "DISCIPLINED_FOLD": 0.10, "TRAP_SLOWPLAY": 0.10
             }
 
-        # Validate and sanitize action legality
-        valid_actions = {"FOLD", "CHECK_CALL", "RAISE", "ALL_IN"}
+        # Validate and sanitize action legality against current situation
+        valid_actions = set(action_criteria.keys())
         if action_choice not in valid_actions:
             if isinstance(action_choice, str):
                 upper = action_choice.upper().strip()
-                if "CALL" in upper or "CHECK" in upper:
+                if ("CALL" in upper or "CHECK" in upper) and "CHECK_CALL" in valid_actions:
                     action_choice = "CHECK_CALL"
-                elif "RAISE" in upper or "BET" in upper:
+                elif ("RAISE" in upper or "BET" in upper) and "RAISE" in valid_actions:
                     action_choice = "RAISE"
-                elif "ALL" in upper or "SHOVE" in upper:
+                elif ("ALL" in upper or "SHOVE" in upper) and "ALL_IN" in valid_actions:
                     action_choice = "ALL_IN"
-                elif "FOLD" in upper:
+                elif "FOLD" in upper and "FOLD" in valid_actions:
                     action_choice = "FOLD"
                 else:
                     action_choice = "CHECK_CALL"
@@ -579,37 +787,71 @@ class LayaPokerEngine:
             latency_ms=latency_ms,
             confidence=max(action_conf, 0.0),
             probabilities={"action": action_probs, "intent": intent_probs},
-            evaluated_hand=eval_desc,
+            evaluated_hand=f"[{hand_tier}] {eval_desc}",
             pot_odds_pct=pot_odds_str
         )
 
-    def _persona_rule_fallback(self, player: Player, to_call: int, eval_desc: str) -> Tuple[str, str]:
-        """Heuristic fallback tailored to each player's distinct persona."""
-        has_pair_or_better = any(kw in eval_desc for kw in ["Pair", "Two Pair", "Three", "Straight", "Flush", "Full House"])
-        has_draw = "Draw" in eval_desc
-
+    def _persona_rule_fallback(self, player: Player, to_call: int, hand_tier: str, eval_desc: str) -> Tuple[str, str]:
+        """Heuristic fallback tailored to each player's distinct persona and semantic hand tier."""
         if "Alice" in player.name:  # LAG
             if to_call == 0:
-                return ("RAISE", "BLUFF_PRESSURE") if random.random() < 0.6 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
-            if has_pair_or_better or has_draw:
-                return ("RAISE", "VALUE_BET") if random.random() < 0.55 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
-            return ("RAISE", "BLUFF_PRESSURE") if random.random() < 0.30 else ("FOLD", "DISCIPLINED_FOLD")
+                if hand_tier in ("MONSTER", "STRONG"):
+                    return ("RAISE", "VALUE_BET") if random.random() < 0.70 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
+                elif hand_tier == "MEDIUM":
+                    return ("CHECK_CALL", "POT_ODDS_DEFENSE") if random.random() < 0.60 else ("RAISE", "BLUFF_PRESSURE")
+                else:  # WEAK
+                    return ("RAISE", "BLUFF_PRESSURE") if random.random() < 0.45 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
+            else:
+                if hand_tier == "MONSTER":
+                    return ("RAISE", "VALUE_BET") if random.random() < 0.75 else ("CHECK_CALL", "TRAP_SLOWPLAY")
+                elif hand_tier == "STRONG":
+                    return ("RAISE", "VALUE_BET") if random.random() < 0.55 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
+                elif hand_tier == "MEDIUM":
+                    r = random.random()
+                    if r < 0.55:
+                        return ("CHECK_CALL", "POT_ODDS_DEFENSE")
+                    elif r < 0.80:
+                        return ("FOLD", "DISCIPLINED_FOLD")
+                    else:
+                        return ("RAISE", "BLUFF_PRESSURE")
+                else:  # WEAK
+                    return ("FOLD", "DISCIPLINED_FOLD") if random.random() < 0.75 else ("RAISE", "BLUFF_PRESSURE")
 
         elif "Bob" in player.name:  # TAG
             if to_call == 0:
-                return ("RAISE", "VALUE_BET") if has_pair_or_better else ("CHECK_CALL", "POT_ODDS_DEFENSE")
-            if has_pair_or_better:
-                return ("RAISE", "VALUE_BET") if random.random() < 0.40 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
-            if has_draw and to_call <= 40:
-                return ("CHECK_CALL", "POT_ODDS_DEFENSE")
-            return ("FOLD", "DISCIPLINED_FOLD")
+                if hand_tier in ("MONSTER", "STRONG"):
+                    return ("RAISE", "VALUE_BET") if random.random() < 0.80 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
+                else:
+                    return ("CHECK_CALL", "POT_ODDS_DEFENSE")
+            else:
+                if hand_tier == "MONSTER":
+                    return ("RAISE", "VALUE_BET") if random.random() < 0.75 else ("ALL_IN", "VALUE_BET")
+                elif hand_tier == "STRONG":
+                    return ("RAISE", "VALUE_BET") if random.random() < 0.45 else ("CHECK_CALL", "POT_ODDS_DEFENSE")
+                elif hand_tier == "MEDIUM":
+                    if to_call <= 40:
+                        return ("CHECK_CALL", "POT_ODDS_DEFENSE")
+                    return ("FOLD", "DISCIPLINED_FOLD")
+                else:  # WEAK
+                    return ("FOLD", "DISCIPLINED_FOLD")
 
         else:  # Charlie (Tricky)
             if to_call == 0:
-                return ("CHECK_CALL", "TRAP_SLOWPLAY") if random.random() < 0.50 else ("RAISE", "BLUFF_PRESSURE")
-            if has_pair_or_better:
-                return ("CHECK_CALL", "TRAP_SLOWPLAY") if random.random() < 0.40 else ("RAISE", "VALUE_BET")
-            return ("CHECK_CALL", "POT_ODDS_DEFENSE") if random.random() < 0.50 else ("FOLD", "DISCIPLINED_FOLD")
+                if hand_tier == "MONSTER":
+                    return ("CHECK_CALL", "TRAP_SLOWPLAY") if random.random() < 0.60 else ("RAISE", "VALUE_BET")
+                elif hand_tier == "STRONG":
+                    return ("CHECK_CALL", "POT_ODDS_DEFENSE") if random.random() < 0.50 else ("RAISE", "VALUE_BET")
+                else:
+                    return ("CHECK_CALL", "POT_ODDS_DEFENSE") if random.random() < 0.70 else ("RAISE", "BLUFF_PRESSURE")
+            else:
+                if hand_tier == "MONSTER":
+                    return ("CHECK_CALL", "TRAP_SLOWPLAY") if random.random() < 0.55 else ("RAISE", "VALUE_BET")
+                elif hand_tier == "STRONG":
+                    return ("CHECK_CALL", "POT_ODDS_DEFENSE") if random.random() < 0.60 else ("RAISE", "VALUE_BET")
+                elif hand_tier == "MEDIUM":
+                    return ("CHECK_CALL", "POT_ODDS_DEFENSE") if random.random() < 0.65 else ("FOLD", "DISCIPLINED_FOLD")
+                else:  # WEAK
+                    return ("FOLD", "DISCIPLINED_FOLD") if random.random() < 0.70 else ("RAISE", "BLUFF_PRESSURE")
 
 
 # ============================================================================
@@ -1070,14 +1312,36 @@ def format_card_box(card: Optional[Card]) -> List[str]:
 
 def render_poker_table(game: TexasHoldemGame, auto_play: bool, speed: int) -> str:
     """Render complete spectator God-Mode poker table and Telemetry HUD."""
+    # Terminal size check for interactive mode
+    if sys.stdout.isatty():
+        cols, rows = shutil.get_terminal_size((80, 40))
+        if cols < 80 or rows < 35:
+            warn_lines = [
+                f"{COLOR_BOLD}{COLOR_YELLOW}⚠️  TERMINAL WINDOW TOO SMALL{COLOR_RESET}",
+                f"Current size: {cols} cols × {rows} rows",
+                f"Required minimum: 80 cols × 35 rows",
+                pad_right("", 78),
+                "Please expand or maximize your terminal window to view the poker table.",
+                pad_right("", 78),
+                f"Hand #{game.hand_number} │ Stakes: {game.small_blind}/{game.big_blind} │ Street: {game.street} │ Pot: {game.pot} chips",
+                f"Active: {game.players[game.current_player_idx].name}",
+                pad_right("", 78),
+                f"{COLOR_BOLD}[Q]{COLOR_RESET} Quit"
+            ]
+            return "\n".join(f"{pad_right(wl, max(cols, 78))}{CLEAR_LINE}" for wl in warn_lines) + CLEAR_BELOW
+
+        is_compact = (rows < 38)
+    else:
+        is_compact = False
+
     lines: List[str] = []
 
-    # Title Banner
+    # Title Banner (3 lines)
     mode_text = f"{COLOR_GREEN}AUTO-PLAY (Speed {speed}){COLOR_RESET}" if auto_play else f"{COLOR_YELLOW}STEP MODE [SPACE]{COLOR_RESET}"
     dealer_p = game.players[game.dealer_idx].name
-    lines.append(f"{COLOR_BOLD}{COLOR_CYAN}═══ TEXAS HOLD'EM POKER • LAYA SYSTEM 1 NEURAL POKER TABLE ═══{COLOR_RESET}")
-    lines.append(f" Hand #{game.hand_number} │ Stakes: {game.small_blind}/{game.big_blind} │ Dealer Button: (D) on {dealer_p} │ Mode: {mode_text}")
-    lines.append("──────────────────────────────────────────────────────────────────────────────")
+    lines.append(pad_right(f"{COLOR_BOLD}{COLOR_CYAN}═══ TEXAS HOLD'EM POKER • LAYA SYSTEM 1 NEURAL POKER TABLE ═══{COLOR_RESET}", 78))
+    lines.append(pad_right(f" Hand #{game.hand_number} │ Stakes: {game.small_blind}/{game.big_blind} │ Dealer Button: (D) on {dealer_p} │ Mode: {mode_text}", 78))
+    lines.append(pad_right("──────────────────────────────────────────────────────────────────────────────", 78))
 
     # Helper to build a 37-column player box
     def player_box(p: Player) -> List[str]:
@@ -1121,18 +1385,20 @@ def render_poker_table(game: TexasHoldemGame, auto_play: bool, speed: int) -> st
     bob_box = player_box(game.players[1])
     bob_indent = " " * 20
     for line in bob_box:
-        lines.append(bob_indent + line)
+        lines.append(pad_right(bob_indent + line, 78))
 
-    lines.append("")
+    if not is_compact:
+        lines.append(pad_right("", 78))
 
     # Middle Seats: Alice (Seat 0, Left) and Charlie (Seat 2, Right): 37 + 4 + 37 = 78 chars
     alice_box = player_box(game.players[0])
     charlie_box = player_box(game.players[2])
     gap = "    "
     for a_line, c_line in zip(alice_box, charlie_box):
-        lines.append(f"{a_line}{gap}{c_line}")
+        lines.append(pad_right(f"{a_line}{gap}{c_line}", 78))
 
-    lines.append("")
+    if not is_compact:
+        lines.append(pad_right("", 78))
 
     # Center Felt Table (width 78)
     c_cards: List[Optional[Card]] = [None] * 5
@@ -1165,7 +1431,7 @@ def render_poker_table(game: TexasHoldemGame, auto_play: bool, speed: int) -> st
     lines.append(f"{COLOR_GREEN}│{COLOR_RESET}{labels_row}{COLOR_GREEN}│{COLOR_RESET}")
     lines.append(f"{COLOR_GREEN}╰────────────────────────────────────────────────────────────────────────────╯{COLOR_RESET}")
 
-    # Laya Telemetry HUD (width 78)
+    # Laya Telemetry HUD (invariant 8 rows: 1 top border + 7 inner rows)
     lines.append(f"{COLOR_BOLD}{COLOR_CYAN}┌── LAYA SYSTEM 1 TELEMETRY HUD ──────────────────────────────────────────────┐{COLOR_RESET}")
     if game.last_decision is not None:
         dec = game.last_decision
@@ -1188,25 +1454,31 @@ def render_poker_table(game: TexasHoldemGame, auto_play: bool, speed: int) -> st
             lines.append(f"│{prob_line}│")
     else:
         lines.append(f"│{pad_right(' Waiting for active player neural forward pass...', 76)}│")
-        for _ in range(5):
+        for _ in range(6):
             lines.append(f"│{' ' * 76}│")
 
+    # Live Action Log (padded to full 78 chars)
     lines.append(f"{COLOR_BOLD}{COLOR_CYAN}└── Live Action Log ──────────────────────────────────────────────────────────┘{COLOR_RESET}")
-    for log_msg in game.action_log[-4:]:
-        lines.append(f"  • {log_msg}")
-    for _ in range(4 - len(game.action_log[-4:])):
-        lines.append(" ")
+    log_slots = 3 if is_compact else 4
+    for log_msg in game.action_log[-log_slots:]:
+        lines.append(pad_right(f"  • {log_msg}", 78))
+    for _ in range(log_slots - len(game.action_log[-log_slots:])):
+        lines.append(pad_right("", 78))
 
-    lines.append("──────────────────────────────────────────────────────────────────────────────")
+    lines.append(pad_right("──────────────────────────────────────────────────────────────────────────────", 78))
     lines.append(
-        f"{COLOR_BOLD}[SPACE/ENTER]{COLOR_RESET} Step  "
-        f"{COLOR_BOLD}[A]{COLOR_RESET} Auto-Play: {'ON' if auto_play else 'OFF'}  "
-        f"{COLOR_BOLD}[1-5]{COLOR_RESET} Speed ({speed})  "
-        f"{COLOR_BOLD}[R]{COLOR_RESET} Rebuy  "
-        f"{COLOR_BOLD}[Q]{COLOR_RESET} Quit"
+        pad_right(
+            f"{COLOR_BOLD}[SPACE/ENTER]{COLOR_RESET} Step  "
+            f"{COLOR_BOLD}[A]{COLOR_RESET} Auto-Play: {'ON' if auto_play else 'OFF'}  "
+            f"{COLOR_BOLD}[1-5]{COLOR_RESET} Speed ({speed})  "
+            f"{COLOR_BOLD}[R]{COLOR_RESET} Rebuy  "
+            f"{COLOR_BOLD}[Q]{COLOR_RESET} Quit",
+            78
+        )
     )
 
-    return "\n".join(lines)
+    # Every line has CLEAR_LINE (\033[K) and frame ends with CLEAR_BELOW (\033[J)
+    return "\n".join(f"{line}{CLEAR_LINE}" for line in lines) + CLEAR_BELOW
 
 
 # ============================================================================
@@ -1392,7 +1664,38 @@ def run_test_suite():
     board_split2 = [Card(14, "♣"), Card(14, "♥"), Card(13, "♦"), Card(12, "♠"), Card(10, "♦")]
     assert eval_5_cards(board_split1)[:2] == eval_5_cards(board_split2)[:2], "Split pot hands should have equal score"
 
-    print(f"  {COLOR_GREEN}✓ Hand evaluator, wheel straight, Broadway, flushes, and kicker tiebreakers verified flawlessly.{COLOR_RESET}")
+    # Semantic Hand Tier Categorization Tests
+    assert categorize_hand_strength([Card(14, "♠"), Card(14, "♦")], []) == "MONSTER", "AA preflop should be MONSTER"
+    assert categorize_hand_strength([Card(13, "♠"), Card(13, "♦")], []) == "MONSTER", "KK preflop should be MONSTER"
+    assert categorize_hand_strength([Card(12, "♠"), Card(12, "♦")], []) == "STRONG", "QQ preflop should be STRONG"
+    assert categorize_hand_strength([Card(14, "♠"), Card(13, "♠")], []) == "STRONG", "AKs preflop should be STRONG"
+    assert categorize_hand_strength([Card(10, "♠"), Card(10, "♦")], []) == "MEDIUM", "TT preflop should be MEDIUM"
+    assert categorize_hand_strength([Card(8, "♠"), Card(7, "♠")], []) == "MEDIUM", "87s preflop should be MEDIUM"
+    assert categorize_hand_strength([Card(7, "♠"), Card(2, "♦")], []) == "WEAK", "72o preflop should be WEAK"
+
+    # Postflop tiers
+    k_flop = [Card(13, "♥"), Card(8, "♣"), Card(4, "♦")]
+    assert categorize_hand_strength([Card(13, "♠"), Card(14, "♦")], k_flop) == "STRONG", "Top pair Ace kicker should be STRONG"
+    assert categorize_hand_strength([Card(13, "♠"), Card(2, "♦")], k_flop) == "MEDIUM", "Top pair weak kicker should be MEDIUM"
+    assert categorize_hand_strength([Card(8, "♠"), Card(7, "♦")], k_flop) == "MEDIUM", "Middle pair should be MEDIUM"
+    assert categorize_hand_strength([Card(4, "♠"), Card(3, "♦")], k_flop) == "MEDIUM", "Bottom pair should be MEDIUM"
+    assert categorize_hand_strength([Card(7, "♠"), Card(2, "♦")], k_flop) == "WEAK", "72o on K84 should be WEAK"
+    assert categorize_hand_strength([Card(8, "♠"), Card(8, "♦")], [Card(8, "♥"), Card(4, "♣"), Card(4, "♦")]) == "MONSTER", "Full house should be MONSTER"
+
+    print(f"  {COLOR_GREEN}✓ Hand evaluator, semantic tiers (MONSTER/STRONG/MEDIUM/WEAK), wheel straight, and kicker tiebreakers verified flawlessly.{COLOR_RESET}")
+
+    # Verify Telemetry HUD Invariant Row Height
+    dummy_game = TexasHoldemGame(agent=None)
+    dummy_game.start_new_hand()
+    rendered_no_dec = render_poker_table(dummy_game, False, 3)
+    dummy_game.last_decision = DecisionResult(
+        player_name="TestPlayer", action="CHECK_CALL", tactical_intent="POT_ODDS_DEFENSE",
+        latency_ms=10.0, confidence=0.8, probabilities={"action": {"CHECK_CALL": 0.8, "RAISE": 0.2}},
+        evaluated_hand="[MEDIUM] One Pair", pot_odds_pct="0.0%"
+    )
+    rendered_with_dec = render_poker_table(dummy_game, False, 3)
+    assert len(rendered_no_dec.split("\n")) == len(rendered_with_dec.split("\n")), "Table line count must be strictly invariant whether decision is None or active"
+    print(f"  {COLOR_GREEN}✓ Telemetry HUD invariant row height (zero jitter) verified flawlessly.{COLOR_RESET}")
 
     # 2. Side Pots Test
     print("[2/5] Verifying Side Pot & Split Pot Calculation...")
