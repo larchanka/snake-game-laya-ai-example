@@ -28,8 +28,8 @@ A real-time Pong match where you play against a Laya AI opponent.
 
 ---
 
-### 3. Checkers Game (`chess.py`)
-An 8x8 Checkers (English Draughts) game where a human player competes against Laya AI.
+### 3. Checkers Game (`checkers.py`)
+An 8x8 Checkers (English Draughts) game where a human player competes against Laya AI. (Formerly `chess.py`, with backwards-compatible stub).
 
 - **Pieces:**
   - `🔴` Player Men / `👑` Player Kings (Red/Green)
@@ -137,10 +137,12 @@ python poker.py
 ### Run Checkers:
 ```bash
 # From repo root
-snake/.venv/bin/python snake/chess.py
+snake/.venv/bin/python snake/checkers.py
 
 # Or within the snake directory:
-python chess.py
+python checkers.py
+
+# (Backwards compatibility: python chess.py delegates to checkers.py)
 ```
 
 ### Run Snake:
